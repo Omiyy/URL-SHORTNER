@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     redis_cache_ttl_seconds: int = 3600
     click_flush_interval_seconds: int = 60
+    redis_max_connections: int = 10
+    api_timeout_seconds: float = 3.0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

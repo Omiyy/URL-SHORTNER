@@ -41,3 +41,4 @@ async def redirect_short_url(
 
     await buffer_click(redis, short_code)
     return RedirectResponse(url=original_url, status_code=302)
+

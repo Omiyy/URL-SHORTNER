@@ -1,9 +1,12 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
+from sqlalchemy.exc import DBAPIError
 
 from app.core.config import settings
 from app.db.base import Base
@@ -18,7 +21,12 @@ from app.services.click_buffer import flush_click_buffer, flush_loop
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    redis = Redis.from_url(
+        settings.redis_url, 
+        decode_responses=True,
+        max_connections=settings.redis_max_connections,
+        socket_timeout=settings.api_timeout_seconds
+    )
     app.state.redis = redis
 
     async with engine.begin() as conn:
@@ -43,6 +51,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+@app.exception_handler(RedisTimeoutError)
+async def redis_timeout_handler(request: Request, exc: RedisTimeoutError):
+    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - Cache Timeout"})
+
+@app.exception_handler(DBAPIError)
+async def dbapi_error_handler(request: Request, exc: DBAPIError):
+    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - Database Timeout"})
+
+@app.exception_handler(asyncio.exceptions.TimeoutError)
+async def asyncio_timeout_handler(request: Request, exc: asyncio.exceptions.TimeoutError):
+    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - Request Timeout"})
 
 frontend_origin = settings.frontend_origin.rstrip("/")
 
