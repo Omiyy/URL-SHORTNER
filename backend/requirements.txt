@@ -5,3 +5,5 @@ asyncpg==0.30.0
 redis==5.2.1
 pydantic-settings==2.8.1
 python-dotenv==1.0.1
+PyJWT==2.14.0
+pwdlib[argon2]

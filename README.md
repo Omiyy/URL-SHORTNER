@@ -1,200 +1,244 @@
-# FastURL: Production-Ready URL Shortener
+# FastURL
 
-FastURL is a mini Bitly-like service designed for high throughput with low database write pressure.
+Production-style URL shortener built to handle high-throughput redirect
+traffic by decoupling write-heavy click tracking from the hot redirect path.
 
-## Why PostgreSQL
+**Stack:** FastAPI (async) · PostgreSQL (`asyncpg`) · Upstash Redis ·
+React + Vite + Tailwind · Docker · Render + Vercel
 
-- Strong consistency for URL mappings and analytics records.
-- Mature indexing and transactional guarantees (critical for unique short code enforcement).
-- Reliable operational tooling and easy horizontal scaling via read replicas.
+---
 
-## Architecture Summary
+## Table of contents
 
-- Backend: FastAPI (async routes).
-- Frontend: React + Vite + Tailwind CSS.
-- Cache and write buffering: Redis.
-- Primary database: PostgreSQL.
-- Reverse proxy and rate limiting: Nginx.
-- Deployment: Docker Compose.
+- [Architecture](#architecture)
+- [Why Redis](#why-redis-the-stateless-tradeoff)
+- [Background click flushing](#background-click-flushing-idempotent)
+- [Redis eviction policy](#redis-eviction-policy)
+- [Short code generation](#short-code-generation-strategy)
+- [Authentication](#authentication-stateless--secure-rotation)
+- [Deliberate omissions](#deliberate-omissions-tradeoffs-accepted)
+- [Database schema](#database-schema)
+- [Setup & deployment](#setup--deployment)
 
-## Folder Structure
+---
 
-```text
-URL-SHORTNER/
-  backend/
-    app/
-      core/
-      db/
-      models/
-      routers/
-      schemas/
-      services/
-      main.py
-    .env.example
-    Dockerfile
-    requirements.txt
-  frontend/
-    src/
-      api/
-      components/
-      pages/
-      App.jsx
-      index.css
-      main.jsx
-    .env.example
-    Dockerfile
-    index.html
-    nginx.conf
-    package.json
-    postcss.config.js
-    tailwind.config.js
-    vite.config.js
-  nginx/
-    nginx.conf
-  docker-compose.yml
-  README.md
+## Architecture
+
+| Layer | Choice | Why |
+|---|---|---|
+| Backend | FastAPI, async routes | high concurrency, low I/O wait overhead |
+| Primary DB | PostgreSQL via SQLAlchemy + `asyncpg` | source of truth, ACID writes |
+| Cache / write buffer | Upstash Redis (serverless) | absorbs click-write load off Postgres |
+| Frontend | React + Vite + Tailwind | fast dev loop, small bundle |
+| Deployment | Docker, Render (API) + Vercel (frontend) | container parity between local/prod |
+
+```
+Browser → Vercel (React SPA) → Render (FastAPI, Docker)
+                                     ├── PostgreSQL (source of truth)
+                                     └── Redis (cache + write buffer)
 ```
 
-## API Endpoints
+---
 
-- `POST /api/shorten`
-  - Input: `{ "url": "https://example.com" }`
-  - Optional bonus fields: `custom_alias`, `expires_in_days`
-  - Output: `{ "short_url": "http://domain/abc123", "short_code": "abc123" }`
-- `GET /{short_code}`
-  - Redirects with HTTP `302`
-- `GET /api/stats/{short_code}`
-  - Returns URL metadata and click count
-- `GET /health`
-  - Liveness and dependency checks (DB + Redis)
+## Why Redis? (The "stateless" tradeoff)
 
-## Redis Buffering Strategy (Low DB Writes)
+If every `302` redirect ran `UPDATE urls SET no_of_clicks = no_of_clicks + 1`
+directly against Postgres, the database would become a write bottleneck under
+real traffic. Redis sits in front of that path as both a **read-through
+cache** and a **write-behind buffer**:
 
-1. Redirect requests do **not** increment Postgres directly.
-2. Each redirect runs `HINCRBY click_buffer {short_code} 1` in Redis.
-3. Every 60 seconds, the worker:
-   - Moves `click_buffer` to an inflight hash key (`click_buffer_inflight:{batch_id}`).
-   - Flushes aggregated counts into Postgres in one transaction.
-   - Stores `batch_id` in `click_flush_batches` to make the flush idempotent.
-4. Inflight batches left from crashes are retried safely.
+1. **Cache** — lookups check Redis (`url:{code}`) first; misses fall back to
+   Postgres and get written into Redis with a TTL (default 1 hour).
+2. **Write buffer** — redirects never touch Postgres directly. They increment
+   an in-memory hash counter: `HINCRBY click_buffer {short_code} 1`.
+3. **Fallback** — if Redis is unreachable, the API catches `RedisError` and
+   falls back to reading/writing Postgres directly. This is a deliberate
+   choice to prioritize availability over performance during a cache outage,
+   rather than failing the redirect.
 
-Redis AOF persistence (`appendonly yes`) reduces loss risk for buffered counts.
+---
 
-## Database Schema
+## Background click flushing (idempotent)
 
-### `urls`
+A background worker runs every `CLICK_FLUSH_INTERVAL_SECONDS` (default 60s):
 
-- `id` (PK)
-- `short_code` (unique indexed)
-- `original_url`
-- `clicks` (aggregated persisted count)
-- `created_at`
-- `last_accessed`
-- `expires_at` (bonus feature)
+1. Renames `click_buffer` to an inflight key: `click_buffer_inflight:{batch_id}`.
+2. Reads the aggregated counts and bulk-updates Postgres in one transaction.
+3. Records the `batch_id` in `click_flush_batches`.
 
-### `click_flush_batches`
+**Crash safety:** if the worker dies before deleting the inflight key, the
+next loop retries it. The `click_flush_batches` table guarantees a batch is
+only ever applied to Postgres once, even on retry.
 
-- `batch_id` (PK)
-- `applied_at`
+---
 
-Used to ensure each batch of buffered clicks is applied at most once.
+## Redis eviction policy
 
-## Performance Notes (10,000 RPM / ~166 RPS)
+Configured in `redis.conf` as `maxmemory-policy volatile-lru`.
 
-- FastAPI async endpoints reduce I/O wait overhead.
-- SQLAlchemy async engine with pooling (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`).
-- Redis cache-first read path for redirects.
-- Aggregated click writes every 60 seconds instead of per request.
-- Nginx handles edge rate limiting and keeps backend focused on app logic.
+| Key type | TTL | Evictable |
+|---|---|---|
+| Read cache (`url:{code}`) | yes (default 1h) | yes |
+| Click buffer (`click_buffer`) | none | **no** — must survive until flushed |
+| Deletion tombstones | none | **no** — must survive until purge worker runs |
 
-## Nginx Rate Limiting
+---
 
-- Configured via:
-  - `limit_req_zone $binary_remote_addr zone=api_limit:10m rate=4r/10s;`
-- Applied on API routes (`/api/`) with burst control.
+## Short code generation strategy
 
-## Setup Instructions
+- 7-character Base62 (`A–Z`, `a–z`, `0–9`) → ~3.5 trillion possible codes.
+- Generated with `secrets.choice` (cryptographically secure, not `random`).
+- On a Postgres `IntegrityError` collision, retries up to
+  `MAX_GENERATION_ATTEMPTS` (8) times. Custom aliases are rejected
+  immediately on collision instead of retried.
 
-1. Clone or open this repository.
-2. Ensure Docker and Docker Compose are installed.
-3. (Optional) Tune env values in `backend/.env.example` and `frontend/.env.example`.
-4. Build and run all services:
+---
+
+## Authentication (stateless + secure rotation)
+
+| Token | Lifetime | Transport | Notes |
+|---|---|---|---|
+| Access token | 15 min | JWT in `Authorization` header | held in frontend memory only |
+| Refresh token | 7 days | random token, `HttpOnly` + `Secure` cookie | rotated on every use |
+
+**Rotation & replay detection:** every refresh issues a new token and
+revokes the old one. Tokens share a `family_id`. If a *revoked* token is
+reused — the signature of a stolen/replayed token — the backend detects the
+replay and revokes the entire family immediately, forcing re-login.
+
+---
+
+## Deliberate omissions (tradeoffs accepted)
+
+| Decision | Reasoning |
+|---|---|
+| No anonymous URL shortening | keeps creation behind an auth boundary — simpler abuse tracking, smaller attack surface |
+| Eventual consistency on click counts | Postgres can lag up to 60s behind real clicks; `/api/urls/{code}/stats` reads Postgres **and** the live Redis buffer to return an accurate count regardless |
+| No hard deletes | delete sets `deleted_at`; a background worker purges rows after `DELETED_URL_RETENTION_SECONDS` (default 24h) |
+
+---
+
+## Database schema
+
+```mermaid
+erDiagram
+    USERS ||--o{ URLS : creates
+    USERS ||--o{ REFRESH_SESSIONS : has
+
+    USERS {
+        UUID user_id PK
+        VARCHAR user_name UK
+        VARCHAR password_hash
+        TIMESTAMPTZ created_at
+    }
+    URLS {
+        VARCHAR short_code PK
+        UUID user_id FK
+        TEXT original_url
+        BIGINT no_of_clicks
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ deleted_at
+    }
+    REFRESH_SESSIONS {
+        UUID session_id PK
+        UUID family_id
+        UUID user_id FK
+        VARCHAR token_hash UK
+        TIMESTAMPTZ expires_at
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ last_used_at
+        TIMESTAMPTZ revoked_at
+    }
+    CLICK_FLUSH_BATCHES {
+        VARCHAR batch_id PK
+        TIMESTAMPTZ applied_at
+    }
+```
+
+<details>
+<summary>Table definitions</summary>
+
+**`users`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | UUID, PK | |
+| `user_name` | VARCHAR(30), UNIQUE, indexed | |
+| `password_hash` | VARCHAR(255) | |
+| `created_at` | TIMESTAMPTZ | |
+
+**`urls`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `short_code` | VARCHAR(32), PK | hot lookup path for every redirect |
+| `user_id` | UUID, FK → `users.user_id`, indexed | |
+| `original_url` | TEXT | |
+| `no_of_clicks` | BIGINT, default 0 | eventually consistent — see above |
+| `created_at` | TIMESTAMPTZ | |
+| `deleted_at` | TIMESTAMPTZ, nullable | soft-delete tombstone |
+
+**`refresh_sessions`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `session_id` | UUID, PK | |
+| `family_id` | UUID, indexed | groups rotated tokens for replay detection |
+| `user_id` | UUID, FK → `users.user_id` | |
+| `token_hash` | VARCHAR(64), UNIQUE | |
+| `expires_at` | TIMESTAMPTZ | |
+| `created_at` | TIMESTAMPTZ | |
+| `last_used_at` | TIMESTAMPTZ, nullable | |
+| `revoked_at` | TIMESTAMPTZ, nullable | |
+
+**`click_flush_batches`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `batch_id` | VARCHAR(64), PK | idempotency key for the flush worker |
+| `applied_at` | TIMESTAMPTZ, default now() | |
+
+</details>
+
+---
+
+## Setup & deployment
+
+### Run locally
 
 ```bash
-docker compose up -d --build
+cd backend
+docker build -t fasturl-api .
+docker run --name fasturl-api -p 8000:8000 --env-file .env fasturl-api
 ```
 
-5. Access application:
-   - Frontend + public endpoint: `http://localhost`
-   - Health check: `http://localhost/health`
-   - FastAPI docs (direct backend): `http://localhost:8000/docs` (if backend port is exposed separately)
+### Environment variables
 
-6. Stop services:
+Read dynamically via Pydantic Settings.
 
-```bash
-docker compose down
-```
+**Required**
 
-7. Stop and remove volumes (optional reset):
+| Variable | Example |
+|---|---|
+| `DATABASE_URL` | `postgresql+asyncpg://user:pass@host/db` |
+| `REDIS_URL` | `rediss://default:pass@host:6379` |
+| `JWT_SECRET_KEY` | — |
 
-```bash
-docker compose down -v
-```
+**Required for production**
 
-## Horizontal Scaling Strategy
+| Variable | Notes |
+|---|---|
+| `APP_DOMAIN` | base URL for generated short links |
+| `FRONTEND_ORIGIN` | drives CORS |
+| `REFRESH_COOKIE_SECURE` | `true` — requires HTTPS |
+| `REFRESH_COOKIE_SAMESITE` | `none` — required for Render ↔ Vercel cross-origin |
 
-- Scale FastAPI replicas behind Nginx (or migrate to Kubernetes + ingress).
-- Keep Redis as a shared cache/buffer layer (single primary with replica/sentinel for HA).
-- Use Postgres read replicas for analytics-heavy read traffic.
-- Add CDN in front of Nginx for static frontend and edge caching.
-- Move background flush logic to a dedicated worker container if traffic spikes significantly.
+**Optional tunables**
 
-## Auto Deploy (GitHub -> Docker Hub -> Server)
-
-This repo includes CI/CD workflow in `.github/workflows/deploy.yml`.
-
-On every push to `main`, it:
-
-1. Builds backend and frontend Docker images.
-2. Pushes tags to Docker Hub:
-  - `omsinghal852/url-shortner:backend-latest`
-  - `omsinghal852/url-shortner:frontend-latest`
-3. SSHes into your server and runs:
-  - `docker compose -f docker-compose.prod.yml pull`
-  - `docker compose -f docker-compose.prod.yml up -d --remove-orphans`
-
-### One-Time Server Setup
-
-1. Install Docker and Docker Compose plugin.
-2. Clone this repo on the server, for example:
-
-```bash
-mkdir -p /opt/url-shortner
-cd /opt/url-shortner
-git clone https://github.com/Omiyy/URL-SHORTNER .
-```
-
-3. Create `backend/.env` on the server with production values (Neon, Upstash, domain, CORS).
-4. Run once manually:
-
-```bash
-docker compose -f docker-compose.prod.yml up -d
-```
-
-### Required GitHub Secrets
-
-Add these in GitHub repo -> Settings -> Secrets and variables -> Actions:
-
-- `DOCKERHUB_USERNAME`
-- `DOCKERHUB_TOKEN`
-- `SERVER_HOST`
-- `SERVER_USER`
-- `SERVER_SSH_KEY`
-- `SERVER_PORT` (optional, default 22)
-- `APP_DIR` (example: `/opt/url-shortner`)
-
-### Notes
-
-- Use branch protection on `main` so only reviewed code auto deploys.
-- Rotate secrets regularly.
-- Keep `backend/.env` only on server, never commit real credentials.
+| Variable | Default |
+|---|---|
+| `DB_POOL_SIZE` | 10 |
+| `REDIS_CACHE_TTL_SECONDS` | 3600 |
+| `REDIS_SOCKET_TIMEOUT_SECONDS` | 10 |
+| `CLICK_FLUSH_INTERVAL_SECONDS` | 60 |
+| `DELETED_URL_RETENTION_SECONDS` | 86400 |

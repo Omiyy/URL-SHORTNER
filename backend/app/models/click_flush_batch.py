@@ -10,4 +10,8 @@ class ClickFlushBatch(Base):
     __tablename__ = "click_flush_batches"
 
     batch_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )

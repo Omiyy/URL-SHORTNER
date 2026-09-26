@@ -1,38 +1,98 @@
-@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --bg-a: #fff7e8;
-  --bg-b: #ffe4c7;
-  --accent: #ff6b35;
-  --ink: #12263a;
-}
-
-body {
-  margin: 0;
-  min-height: 100vh;
-  font-family: "Manrope", sans-serif;
-  color: var(--ink);
-  background:
-    radial-gradient(circle at 10% 10%, rgba(46, 196, 182, 0.25), transparent 40%),
-    radial-gradient(circle at 80% 20%, rgba(255, 107, 53, 0.22), transparent 40%),
-    linear-gradient(135deg, var(--bg-a), var(--bg-b));
-}
-
-.reveal {
-  animation: riseIn 0.5s ease-out both;
-}
-
-@keyframes riseIn {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
+/* ── Base resets ── */
+@layer base {
+  * {
+    box-sizing: border-box;
   }
-  to {
-    opacity: 1;
-    transform: translateY(0);
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply m-0 min-h-screen bg-surface-50 font-sans text-slate-800;
+  }
+
+  /* Subtle global background pattern */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(ellipse at 15% 5%, rgba(99, 102, 241, 0.06), transparent 50%),
+      radial-gradient(ellipse at 85% 95%, rgba(99, 102, 241, 0.04), transparent 50%);
+    pointer-events: none;
+  }
+
+  ::selection {
+    @apply bg-brand-200 text-brand-900;
+  }
+
+  /* Focus ring utility */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand-500;
+  }
+}
+
+/* ── Component utilities ── */
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all duration-150;
+  }
+
+  .btn:active {
+    @apply scale-[0.98];
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-600 text-white shadow-sm hover:bg-brand-700 focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2;
+  }
+
+  .btn-secondary {
+    @apply btn border border-slate-200 bg-white text-slate-700 shadow-sm hover:bg-surface-50 hover:border-slate-300;
+  }
+
+  .btn-ghost {
+    @apply btn text-slate-600 hover:bg-surface-100 hover:text-slate-800;
+  }
+
+  .btn-danger {
+    @apply btn bg-red-50 text-red-600 hover:bg-red-100;
+  }
+
+  .input-field {
+    @apply w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-800 placeholder-slate-400 shadow-sm transition-colors duration-150 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-100;
+  }
+
+  .card {
+    @apply rounded-xl border border-slate-200/80 bg-white shadow-card;
+  }
+
+  .card-hover {
+    @apply card transition-shadow duration-200 hover:shadow-card-hover;
+  }
+
+  /* Short-URL signature display */
+  .short-url-display {
+    @apply font-mono text-base font-medium text-brand-600 tracking-wide;
+  }
+
+  /* Skeleton loading */
+  .skeleton {
+    @apply rounded-md bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 animate-shimmer;
+    background-size: 200% 100%;
+  }
+
+  /* Label */
+  .label {
+    @apply block text-sm font-medium text-slate-600 mb-1.5;
   }
 }

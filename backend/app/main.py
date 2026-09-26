@@ -1,79 +1,114 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
-from redis.exceptions import TimeoutError as RedisTimeoutError
-from sqlalchemy.exc import DBAPIError
+from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
-from app.models.flush_batch import ClickFlushBatch  # noqa: F401
-from app.models.url import URL  # noqa: F401
-from app.routers.api import router as api_router
-from app.routers.health import router as health_router
+from app.models import ClickFlushBatch, RefreshSession, URL, User  # noqa: F401
+from app.redis_service.clicks import flush_click_buffer
+from app.redis_service.worker import maintenance_loop
+from app.routers.auth import router as auth_router
 from app.routers.redirect import router as redirect_router
-from app.services.click_buffer import flush_click_buffer, flush_loop
+from app.routers.urls import router as urls_router
+
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    redis = Redis.from_url(
-        settings.redis_url, 
-        decode_responses=True,
-        max_connections=settings.redis_max_connections,
-        socket_timeout=settings.api_timeout_seconds
-    )
+    # Imports above ensure SQLAlchemy knows both models.
+    async with engine.begin() as connection:
+        logger.info("Starting DB initialization...")
+        print("DB initialization")
+        await connection.run_sync(Base.metadata.create_all)
+        
+
+    redis = None
+    maintenance_task = None
+
+    try:
+        redis = Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            max_connections=settings.redis_max_connections,
+            socket_connect_timeout=settings.redis_socket_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+        )
+        await redis.ping()
+        logger.info("Redis connected successfully")
+        maintenance_task = asyncio.create_task(
+            maintenance_loop(
+                redis,
+                SessionLocal,
+                settings.click_flush_interval_seconds,
+                settings.deleted_url_retention_seconds,
+            )
+        )
+    except (RedisConnectionError, OSError, Exception) as exc:
+        logger.warning("Redis unavailable, running without cache: %s", exc)
+        if redis is not None:
+            try:
+                await redis.aclose()
+            except Exception:
+                pass
+        redis = None
+
     app.state.redis = redis
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    flush_task = asyncio.create_task(flush_loop(redis, SessionLocal))
-    app.state.flush_task = flush_task
 
     yield
 
-    flush_task.cancel()
-    try:
-        await flush_task
-    except asyncio.CancelledError:
-        pass
+    if maintenance_task is not None:
+        maintenance_task.cancel()
+        try:
+            await maintenance_task
+        except asyncio.CancelledError:
+            pass
 
-    async with SessionLocal() as db:
-        await flush_click_buffer(redis, db)
+    if redis is not None:
+        try:
+            async with SessionLocal() as db:
+                await flush_click_buffer(redis, db)
+        except Exception as exc:
+            logger.warning("Failed to flush click buffer on shutdown: %s", exc)
+        await redis.aclose()
 
-    await redis.close()
     await engine.dispose()
 
 
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
-
-@app.exception_handler(RedisTimeoutError)
-async def redis_timeout_handler(request: Request, exc: RedisTimeoutError):
-    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - Cache Timeout"})
-
-@app.exception_handler(DBAPIError)
-async def dbapi_error_handler(request: Request, exc: DBAPIError):
-    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - Database Timeout"})
-
-@app.exception_handler(asyncio.exceptions.TimeoutError)
-async def asyncio_timeout_handler(request: Request, exc: asyncio.exceptions.TimeoutError):
-    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - Request Timeout"})
-
-frontend_origin = settings.frontend_origin.rstrip("/")
+app = FastAPI(
+    title=settings.app_name,
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[frontend_origin],
+    allow_origins=[
+        origin.strip() for origin in settings.frontend_origin.split(",")
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(health_router)
-app.include_router(api_router)
+app.include_router(auth_router)
+app.include_router(urls_router)
+
+
+@app.get("/health")
+async def health_check():
+    async with engine.connect() as connection:
+        await connection.execute(text("SELECT 1"))
+
+    return {"status": "ok"}
+
+
+# Keep this last: its root-level path would otherwise match /health and future routes.
 app.include_router(redirect_router)
