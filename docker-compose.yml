@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: fasturl-postgres
+    environment:
+      POSTGRES_USER: fasturl
+      POSTGRES_PASSWORD: fasturl_local_pw
+      POSTGRES_DB: fasturl
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - db-net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U fasturl" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: fasturl-redis
+    volumes:
+      - redisdata:/data
+    networks:
+      - db-net
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    env_file:
+      - ./backend/.env.local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - db-net
+      - app-net
+    expose:
+      - "8000"
+    deploy:
+      replicas: 4
+
+  nginx:
+    image: nginx:alpine
+    container_name: fasturl-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - app-net
+    ports:
+      - "8000:8000"
+    depends_on:
+      - backend
+
+networks:
+  db-net:
+    internal: true
+  app-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

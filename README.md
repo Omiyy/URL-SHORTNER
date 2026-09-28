@@ -11,6 +11,7 @@ React + Vite + Tailwind · Docker · Render + Vercel
 ## Table of contents
 
 - [Architecture](#architecture)
+- [Performance](#performance)
 - [Why Redis](#why-redis-the-stateless-tradeoff)
 - [Background click flushing](#background-click-flushing-idempotent)
 - [Redis eviction policy](#redis-eviction-policy)
@@ -37,6 +38,24 @@ Browser → Vercel (React SPA) → Render (FastAPI, Docker)
                                      ├── PostgreSQL (source of truth)
                                      └── Redis (cache + write buffer)
 ```
+
+---
+
+## Performance
+
+Load-tested with Locust up to 300 concurrent users across 4 horizontally-scaled
+backend replicas behind nginx. Sustains ~3,000 RPS at 100 users (31ms avg
+latency); backend CPU saturates around 200 users where throughput plateaus at
+~1,600 RPS, with zero failed requests throughout — graceful latency-based
+degradation, not failure, under overload.
+
+Along the way, identified and fixed a Postgres connection-pool exhaustion bug
+when scaling to multiple replicas (aggregate pool size exceeded
+`max_connections`, causing a 45% request failure rate — resolved by tuning
+`DB_POOL_SIZE` per replica), and measured a ~3.7x latency improvement on the
+redirect path from the Redis read-through cache described below.
+
+Full methodology and results: [benchmark/README.md](./benchmark/README.md)
 
 ---
 

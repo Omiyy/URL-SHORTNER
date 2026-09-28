@@ -69,7 +69,7 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> User:
     existing = await db.execute(select(User.user_id).where(User.user_name == payload.user_name))
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(status_code=409, detail="Username is already registered")
-
+    
     user = User(
         user_name=payload.user_name,
         password_hash=await run_in_threadpool(hash_password, payload.password),
@@ -109,10 +109,7 @@ async def login(payload: LoginRequest, response: Response, db: DatabaseSession) 
     await db.commit()
 
     set_refresh_cookie(response, refresh_token)
-    return TokenResponse(
-        access_token=create_access_token(user.user_id),
-        user=user
-    )
+    return TokenResponse(access_token=create_access_token(user.user_id))
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -160,15 +157,7 @@ async def refresh_access_token(
     await db.commit()
 
     set_refresh_cookie(response, new_refresh_token)
-    
-    # We need to fetch the user to return it in the TokenResponse
-    user_result = await db.execute(select(User).where(User.user_id == session.user_id))
-    user = user_result.scalar_one()
-    
-    return TokenResponse(
-        access_token=create_access_token(session.user_id),
-        user=user
-    )
+    return TokenResponse(access_token=create_access_token(session.user_id))
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
