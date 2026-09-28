@@ -109,7 +109,10 @@ async def login(payload: LoginRequest, response: Response, db: DatabaseSession) 
     await db.commit()
 
     set_refresh_cookie(response, refresh_token)
-    return TokenResponse(access_token=create_access_token(user.user_id))
+    return TokenResponse(
+        access_token=create_access_token(user.user_id),
+        user=user
+    )
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -157,7 +160,14 @@ async def refresh_access_token(
     await db.commit()
 
     set_refresh_cookie(response, new_refresh_token)
-    return TokenResponse(access_token=create_access_token(session.user_id))
+    
+    user_result = await db.execute(select(User).where(User.user_id == session.user_id))
+    user = user_result.scalar_one()
+    
+    return TokenResponse(
+        access_token=create_access_token(session.user_id),
+        user=user
+    )
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
